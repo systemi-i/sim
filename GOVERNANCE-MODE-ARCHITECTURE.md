@@ -917,6 +917,373 @@ And add the type to `SubBlockType` union in `apps/sim/blocks/types.ts`.
 
 ---
 
+## 8. Subflows / Containers as Governance Modules
+
+### 8.1 What a Subflow Container Is
+
+Sim has exactly **two** built-in container types — `loop` and `parallel`. Both are implemented as regular `BlockState` entries in the flat `blocks` dict, distinguished by `type: 'loop'` or `type: 'parallel'`. Child blocks are parented to a container by setting `data.parentId` to the container's block ID.
+
+There is no generic "group" container type today.
+
+**Node types registered in React Flow:**
+```typescript
+const nodeTypes = {
+  workflowBlock: WorkflowBlock,       // regular block
+  subflow: SubflowNodeComponent,      // loop / parallel container
+  note: NoteBlock,
+}
+```
+
+### 8.2 Visual Grouping on the Canvas
+
+`SubflowNodeComponent` (`components/subflows/subflow-node.tsx`) renders a resizable bordered box with:
+- A coloured header icon (`RepeatIcon` blue for loop, `SplitIcon` yellow for parallel) and name label
+- An enable/disable badge when the container is disabled
+- A `workflow-drag-handle` class on the header and body — the whole container can be dragged as a unit
+- A `data-nesting-level` attribute computed by walking `data.parentId` ancestors (containers can be nested inside loops but **not** inside parallels — nested parallels/loops inside a parallel are blocked by validation)
+
+Child blocks are placed inside by React Flow's `extent: 'parent'` constraint — they cannot be dragged outside their container rectangle without an explicit `extract_from_subflow` operation.
+
+### 8.3 Handles and External Connections
+
+The container exposes three connection surfaces:
+
+| Handle ID | Side | Direction | Purpose |
+|-----------|------|-----------|--------|
+| _(default)_ | Left | Target | Incoming edge from the block before the container |
+| `loop-end-source` / `parallel-end-source` | Right (mid) | Source | Outgoing edge to the block after the container |
+| `loop-start-source` / `parallel-start-source` | Right (inside) | Source | Start sentinel — the first block **inside** the container connects here |
+
+The internal **Start** pill (shown at top-left inside the container body) exposes the `*-start-source` handle. Blocks inside connect from this start handle → first child block → more children. The `*-end-source` handle on the container's outer right side is where the DAG continues after all iterations/branches complete.
+
+**Scope enforcement** (`lib/workflows/edge-validation`): `removeInvalidScopeEdges()` is run after every copilot operation batch. An edge is dropped if source and target are in incompatible scopes (e.g., a block inside a loop cannot edge directly to a block outside the loop without going through the container's end handle).
+
+### 8.4 Storage: Inline, Not Nested Workflows
+
+Subflows are **not** separate workflow documents. Everything lives inline in the same workflow:
+
+```
+workflow_blocks table
+  ┌─ {id: "loop-abc", type: "loop",  data: {loopType, count, width, height}}
+  ├─ {id: "child-1",  type: "agent", data: {parentId: "loop-abc"}, ...}
+  └─ {id: "child-2",  type: "api",   data: {parentId: "loop-abc"}, ...}
+```
+
+The `workflow_subflows` table exists in the schema but is **not used** by the current frontend or execution engine. The `loops` and `parallels` records in `WorkflowState` are derived at runtime by `generateLoopBlocks()` / `generateParallelBlocks()` — both scan the flat `blocks` dict for containers, then collect the IDs of all blocks whose `data.parentId` equals the container ID.
+
+Container-specific config is stored in `BlockState.data`:
+
+**Loop config in `data`:**
+```typescript
+{
+  loopType: 'for' | 'forEach' | 'while' | 'doWhile'
+  count?: number         // for 'for'
+  collection?: string    // for 'forEach' — expression like <prev.items>
+  whileCondition?: string
+  doWhileCondition?: string
+  width?: number
+  height?: number
+}
+```
+
+**Parallel config in `data`:**
+```typescript
+{
+  parallelType: 'count' | 'collection'
+  count?: number         // for 'count'
+  collection?: string    // for 'collection'
+  width?: number
+  height?: number
+}
+```
+
+### 8.5 Execution Scope
+
+Containers **do not have a separate execution context** in the sense of isolated variable namespaces. However:
+
+- **Loop**: The `LoopOrchestrator` (`executor/orchestrators/loop.ts`) creates a `ctx.loopExecutions` entry keyed by `loopId`. Per iteration, it resets block states for child nodes and re-enqueues them. Blocks inside can access `<loop.index>` and `<loop.currentItem>`. Output is `results[]` — an array of per-iteration outputs.
+- **Parallel**: The `ParallelOrchestrator` clones child blocks with unique IDs for each branch, runs all branches concurrently, and collects `results[]` at the end. Each branch can access `<parallel.index>` and `<parallel.currentItem>`.
+- **Cross-scope refs**: A block inside a loop **cannot** reference the output of another block inside the same loop in its condition (conditions are evaluated before iteration). It can reference blocks outside the loop or `<loop.index>` / workflow variables.
+
+### 8.6 Reuse and Templating
+
+There is **no native subflow templating** mechanism. Containers cannot be saved as reusable components and dropped onto new workflows. The only reuse vector today is:
+1. **Copy/paste** the container and its children within or across workflows (the canvas supports this via clipboard serialisation).
+2. **Copilot `@templates` context** — the mention system allows referencing templates, which the AI can use to scaffold pre-wired groups of blocks. Templates are stored as serialised workflow states and can contain containers.
+3. **Copilot `insert_into_subflow`** — the AI can programmatically create a container and populate it with blocks in a single operation batch.
+
+### 8.7 Governance Implication: Subflows as Protocol Modules
+
+The core question is: **can we use subflows as drag-and-drop governance modules (Register, Authorise, Resolve, etc.)?**
+
+**What works today:**
+- The copilot can generate a full module structure in one turn: `add` a `loop` container (1 iteration), then `insert_into_subflow` the required CP blocks (Proposal, Vote, QuorumCheck, etc.). The user gets a pre-wired visual group.
+- `@templates` mentions can supply a serialised module state that the copilot rehydrates into `add`/`insert_into_subflow` operations.
+- Blocks inside a container can reference each other via `<blockname.output>` — so CP blocks composing a module can wire data internally.
+
+**What doesn't work today:**
+- There is no dedicated **`'group'` container type**. Using a `loop` with 1 iteration is a workaround and introduces loop semantics (iteration count UI, loop index outputs) that are irrelevant to governance modules.
+- There is no **drop-from-toolbar** module primitive. The toolbar only shows individual blocks, not compound templates.
+- Containers **cannot be named** distinctly as "governance modules" — they display as `Loop` or `Parallel` with a custom name label.
+
+**Recommended approach for governance modules:**
+
+| Option | Effort | Notes |
+|--------|--------|-------|
+| A — Add a `'group'` container type | Medium | New `BlockState`, new `SubflowNodeComponent` variant, new handle topology. No execution semantics needed — group is purely visual. | 
+| B — Reuse `loop` (1-iteration) as group | Low | Works immediately. Hacky UX; copilot must always set `loopType: 'for', iterations: 1`. |
+| C — Templates-only (no containers) | Very Low | Modules are just naming conventions; copilot scaffolds the right blocks side-by-side without a container. Governance module = a named set of blocks with a shared prefix. |
+
+**Option C** is recommended for MVP: the copilot scaffolds CP blocks, labels them `Register::Proposal`, `Register::Vote`, etc., and the user sees a flat but correctly wired group. Option A is the right long-term answer for a polished drag-and-drop governance IDE.
+
+---
+
+## 9. AI-Assisted Workflow Design (Copilot)
+
+### 9.1 Overall Architecture
+
+The copilot is a **hybrid client-server system** with a Go backend ("Mothership") as the AI orchestration layer:
+
+```
+Browser (React) ─── SSE stream ──→ Next.js API route (/api/copilot/...)
+                                      │
+                                      ├─ buildCopilotRequestPayload()
+                                      │    assembles workspace context,
+                                      │    integration tool schemas, contexts
+                                      │
+                                      └─→ Go Mothership (AI agent loop)
+                                              │
+                                       tool calls back to Next.js:
+                                              ├── edit_workflow
+                                              ├── get_blocks_metadata
+                                              ├── get_trigger_blocks
+                                              ├── search_documentation
+                                              ├── get_workflow_logs
+                                              ├── knowledge_base / user_table
+                                              └── 200+ integration tools
+```
+
+The **system prompt lives in the Go Mothership**, not in the Next.js codebase. Next.js provides context data (workspace state, tool schemas, @mention content) as structured fields in the request payload — the Mothership merges them into its prompt context.
+
+### 9.2 Context Assembly (`lib/copilot/chat/payload.ts`)
+
+Every copilot request is built by `buildCopilotRequestPayload()`. Key context layers:
+
+#### Workspace Context (`WORKSPACE.md`)
+Generated by `generateWorkspaceContext()` (`lib/copilot/chat/workspace-context.ts`). A Markdown document injected as `workspaceContext` in the payload. Contains:
+- All workflows (name, ID, folder path, last run, deployed status)
+- Knowledge bases, tables, files
+- Connected OAuth integrations
+- Custom tools, MCP servers, skills
+- Active cron jobs
+
+The AI uses this to understand what's already in the workspace before making changes.
+
+#### Integration Tool Schemas
+`buildIntegrationToolSchemas()` iterates every tool in `apps/sim/tools/` (200+ tools) and sends their full JSON Schema definitions as `integrationTools[]` with `defer_loading: true`. The Mothership lazy-loads schemas only when the AI decides to use a particular integration.
+
+MCP tools are discovered dynamically and appended to the same array.
+
+#### @Mention Contexts
+The copilot input supports `@` mentions. Each mention type builds a `ChatContext` object (defined in `stores/panel`):
+
+| Mention type | `kind` | Content passed |
+|-------------|--------|----------------|
+| `@workflows` | `'workflow'` | Workflow ID → AI loads its state JSON |
+| `@workflow-blocks` | `'workflow_block'` | Block ID → AI loads specific block config |
+| `@knowledge` | `'knowledge'` | Knowledge base ID |
+| `@blocks` | `'blocks'` | Block type IDs from the registry |
+| `@templates` | `'templates'` | Template ID → serialised workflow state |
+| `@logs` | `'logs'` | Execution ID → run summary |
+| `@chats` | `'past_chat'` | Previous chat ID → prior conversation |
+| `@docs` | `'docs'` | Triggers documentation search |
+
+#### Slash Commands
+`/fast`, `/research`, `/actions` (mapped to `superagent`) change the Mothership's agent mode and influence which tools it prioritises.
+
+### 9.3 Block Registry Access (`get_blocks_metadata`)
+
+**File:** `lib/copilot/tools/server/blocks/get-blocks-metadata-tool.ts`
+
+When the AI needs to know how to configure a block, it calls `get_blocks_metadata({ blockIds: ['agent', 'condition', ...] })`. This tool:
+1. Looks up each ID in the block registry (`apps/sim/blocks/registry.ts`)
+2. Resolves sub-block schemas, tool access, trigger configs, operation-specific schemas
+3. Returns `CopilotBlockMetadata` for each block — a structured representation including:
+   - `inputs.required[]` / `inputs.optional[]` — all sub-block fields with types, options, defaults
+   - `operations` — per-operation tool IDs, inputs, outputs (for multi-operation blocks like Slack or Gmail)
+   - `triggers[]` — trigger config fields
+   - `bestPractices` — free-text guidance string from `BlockConfig.bestPractices`
+   - `yamlDocumentation` — full MDX doc from `apps/docs/content/docs/yaml/blocks/<id>.mdx` if it exists
+   - `outputs[]` — block output schema
+
+For Loop and Parallel containers, there are `SPECIAL_BLOCKS_METADATA` entries that define their `inputs`, `outputs`, and `subBlocks` inline (since they aren't in the normal registry). These include `bestPractices` strings with specific instructions about what cannot be done (e.g., "Cannot have loops/parallels inside a parallel block").
+
+### 9.4 Workflow Editing via `edit_workflow`
+
+**File:** `lib/copilot/tools/server/workflow/edit-workflow/index.ts`
+
+This is the primary canvas mutation tool. The AI issues an array of `EditWorkflowOperation` objects:
+
+```typescript
+type EditWorkflowOperation = {
+  operation_type: 'add' | 'edit' | 'delete' | 'insert_into_subflow' | 'extract_from_subflow'
+  block_id: string
+  params?: {
+    type?: string                        // block type for 'add'
+    name?: string
+    inputs?: Record<string, any>         // sub-block values
+    connections?: Record<string, any>    // source → target wiring
+    subflowId?: string                   // parent container for 'insert_into_subflow'
+    nestedNodes?: Record<string, any>    // inline child block definitions for 'add'
+    position?: { x: number; y: number }
+  }
+}
+```
+
+**Operation execution pipeline:**
+
+```
+1. normalizeBlockIdsInOperations()  — ensure all IDs are UUIDs
+2. orderOperations()                — delete → extract → add → insert → edit
+3. topologicalSortInserts()         — parents before children
+4. per-operation handlers:
+     handleAddOperation()           — creates block, defers connections
+     handleEditOperation()          — patches sub-block values, loop/parallel config
+     handleDeleteOperation()        — removes block + any children + connected edges
+     handleInsertIntoSubflowOperation() — sets data.parentId, data.extent='parent'
+     handleExtractFromSubflowOperation() — clears data.parentId, repositions
+5. addConnectionsAsEdges()          — resolves deferred connections (all blocks exist now)
+6. removeInvalidScopeEdges()        — drops cross-scope edges
+7. generateLoopBlocks() + generateParallelBlocks()  — rebuild derived state
+8. applyTargetedLayout()            — auto-layout affected subgraph
+9. saveWorkflowToNormalizedTables() — persist to DB
+10. POST /api/workflow-updated       — notify socket server → live canvas update
+```
+
+**Key safety guarantees:**
+- `isBlockTypeAllowed()` checks permission config (per-workspace block allow/denylist)
+- `validateInputsForBlock()` type-checks all sub-block values against schema
+- `preValidateCredentialInputs()` rejects invalid credential or API key references
+- `validateWorkflowSelectorIds()` verifies referenced KB IDs, file IDs, etc. exist in DB
+- Validation errors and skipped items are returned to the AI as structured feedback so it can retry with corrected params
+
+### 9.5 How the AI Knows About Connection Rules
+
+The AI knows block connectivity rules through:
+1. **`get_blocks_metadata`** — the `outputs[]` and `inputs[]` fields tell it what each block produces and consumes.
+2. **The `connections` param** in `add` operations — the AI specifies `source → target` mappings; the engine resolves handle names and validates scope.
+3. **Special handles** — the Mothership's system prompt (in Go) includes documentation on `condition-true/false`, `loop-start-source`, `parallel-start-source`, router route IDs, etc.
+4. **Scope validation feedback** — if the AI tries to wire a cross-scope edge, the `skippedItems` feedback tells it exactly why it was dropped.
+
+### 9.6 Where System Prompts / Instructions Live
+
+| Layer | Location | Who controls it |
+|-------|----------|-----------------|
+| Core system prompt | Go Mothership binary | Sim team |
+| Block `bestPractices` field | `BlockConfig.bestPractices` in `apps/sim/blocks/blocks/*.ts` | Per-block author |
+| Block YAML docs | `apps/docs/content/docs/yaml/blocks/<id>.mdx` | Docs team |
+| Workspace context (WORKSPACE.md) | `lib/copilot/chat/workspace-context.ts` | Generated at request time |
+| @mention contexts | `lib/copilot/tools/handlers/workflow/queries.ts` et al. | Assembled from DB on demand |
+| User-supplied context | `@` mentions in chat input | User |
+
+### 9.7 Governance Implication: Injecting IGSL Grammar and Protocol Spec
+
+The copilot is well-positioned to become a **governance protocol assistant** — scaffolding CP compositions, warning about spec violations, and generating full module structures from a natural-language request. Here are the specific injection points:
+
+#### A — `bestPractices` on CP Block Configs (Immediate)
+
+Every governance block definition (e.g., `governance_proposal.ts`, `governance_vote.ts`) should include a `bestPractices` string that encodes IGSL grammar rules for that CP type:
+
+```typescript
+const GovernanceVoteBlock: BlockConfig = {
+  type: 'governance_vote',
+  bestPractices: `
+    - Must be preceded by a governance_proposal block (Register module requires Proposal → Vote order).
+    - voter_list input must reference a role gate output or a static list.
+    - quorum_threshold must be a fraction (0.0–1.0) or an absolute count.
+    - Connect output.approved to the next step; output.rejected to a veto or resolution block.
+    - For a two-phase Authorise module, pair with governance_timelock before final execution.
+  `,
+  // ...
+}
+```
+
+This is surfaced to the AI via `get_blocks_metadata` with zero extra infrastructure.
+
+#### B — Governance Context in `workspaceContext` (Short-term)
+
+Extend `generateWorkspaceContext()` (or add a parallel `generateGovernanceContext()` call) to inject a `## Governance Protocol` section into the workspace context when governance blocks are present:
+
+```markdown
+## Governance Protocol (IGSL v1.2)
+
+### 8 CP Types
+- Register: Proposal, Vote
+- Authorise: RoleGate, Quorum
+- Resolve: Timelock, Veto
+- Audit: AuditLog
+- Delegate: Delegation
+
+### 6 Standard Modules
+- Register = Proposal → Vote → QuorumCheck
+- Authorise = RoleGate → Timelock
+- Resolve = Veto → Resolution
+- ...
+
+### 7 Composition Patterns
+- Simple: Register → Authorise → Execute
+- Multi-stage: Register → Authorise → Register (escalation) → Execute
+- ...
+```
+
+This is injected as plain text into the `workspaceContext` field of the payload — the Mothership sees it as part of WORKSPACE.md.
+
+#### C — `@governance-spec` Mention Type (Medium-term)
+
+Add a new `ChatContext` kind (`'governance_spec'`) and a corresponding server-side resource handler that returns the full IGSL spec digest, CP type reference manual, and pattern library when the user types `@governance-spec`. The AI can pull this on demand rather than having it in every prompt.
+
+Implementation path:
+1. Add `'governance_spec'` to `MentionFolderId` in `constants.ts`
+2. Add a `governance-spec` folder config to `FOLDER_CONFIGS`
+3. Add a resource handler in `lib/copilot/request/handlers/resource.ts` that reads from a static spec file in the workspace VFS
+
+#### D — Governance Module Templates (Medium-term)
+
+Create serialised workflow JSON files for each of the 6 standard modules (Register, Authorise, Resolve, Audit, Delegate, Escrow) and register them as templates in the templates data source. The user can then type `@templates` and select "Register Module" — the AI rehydrates the template into `add` / `insert_into_subflow` operations against the current workflow.
+
+Alternatively, the AI can be prompted: *"I need a permissioning chain for building permits"* → Mothership calls `get_blocks_metadata` for each CP type → issues a batch `edit_workflow` with ~10–15 operations scaffolding the full module structure.
+
+#### E — `get_governance_spec` Server Tool (Long-term)
+
+Add a dedicated `get_governance_spec` server tool to `lib/copilot/tools/server/router.ts`:
+
+```typescript
+export const getGovernanceSpecServerTool: BaseServerTool = {
+  name: 'get_governance_spec',
+  // params: { query?: string, section?: 'cp-types' | 'modules' | 'patterns' | 'full' }
+  async execute({ section }) {
+    // Return relevant sections of the IGSL v1.2 spec digest
+    // Optionally: vector-search the spec for query-relevant rules
+  }
+}
+```
+
+This gives the AI a structured way to retrieve spec sections on demand, keeping the system prompt lean and avoiding context window bloat.
+
+#### Summary: Injection Points by Timeline
+
+| What | Where | Timeline | Required infrastructure |
+|------|-------|----------|------------------------|
+| CP block `bestPractices` | `BlockConfig.bestPractices` | Immediate | Just author each governance block config correctly |
+| IGSL spec in workspace context | `generateWorkspaceContext()` extension | Short-term | Add `## Governance Protocol` section to workspace MD |
+| `@governance-spec` mention | New `MentionFolderId` + folder config + resource handler | Medium-term | ~100 LOC in mention system + spec file in VFS |
+| Governance module templates | Template records + serialised module JSON | Medium-term | Author 6 module JSON files; register as templates |
+| `get_governance_spec` tool | New server tool in `lib/copilot/tools/server/` | Long-term | New server tool + spec storage (VFS or DB) |
+
+With options A + B alone (purely additive, no new infrastructure), the copilot can already generate governance protocol workflows from natural language — it will understand CP types, their connections, and standard module compositions.
+
+---
+
 ## Appendix: Key File Index
 
 ### Block System
