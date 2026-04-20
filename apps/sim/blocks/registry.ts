@@ -224,6 +224,8 @@ import { YouTubeBlock } from '@/blocks/blocks/youtube'
 import { ZendeskBlock } from '@/blocks/blocks/zendesk'
 import { ZepBlock } from '@/blocks/blocks/zep'
 import { ZoomBlock } from '@/blocks/blocks/zoom'
+// Governance blocks
+import { GovernanceDecideBlock } from '@/blocks/blocks/governance/decide'
 import type { BlockConfig } from '@/blocks/types'
 
 // Registry of all available blocks, alphabetically sorted
@@ -475,6 +477,8 @@ export const registry: Record<string, BlockConfig> = {
   zendesk: ZendeskBlock,
   zep: ZepBlock,
   zoom: ZoomBlock,
+  // Governance blocks
+  governance_decide: GovernanceDecideBlock,
 }
 
 export const getBlock = (type: string): BlockConfig | undefined => {
