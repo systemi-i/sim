@@ -339,6 +339,17 @@ For automated decisions (automation_level: AUTOMATED): set accountability_actor 
       tooltip: 'Required by IGSL for any outcome that is adverse. "Via CP ID" can reference an APPEAL block downstream.',
     },
 
+    // ── Proposed Outcome ─────────────────────────────────────────────
+    {
+      id: 'proposed_outcome',
+      title: 'Proposed Outcome',
+      type: 'short-input',
+      layout: 'full',
+      description: 'The outcome token being proposed (e.g., APPROVED, DENIED). Set by the submitting actor or automation. For AUTOMATED CPs, wire this from the upstream automation block output using {{<block.output>}} interpolation. For MANUAL/SUPERVISED CPs, this comes from the human via a connected HITL block. The CP block executor reads this field directly for the CommitmentSubmission.',
+      placeholder: 'e.g. APPROVED or {{<upstream_block.outcome>}}',
+      required: true,
+    },
+
     // ── Produces (IGSL v1.2) ─────────────────────────────────────────
     {
       id: 'produces',
@@ -421,7 +432,31 @@ Each block follows the same pattern as DECIDE. Below are the type-specific diffe
 | **OVERRIDE** | `governance_override` | `#EF4444` | `overrides_cp_id` (the CP being overridden); `override_authority` (must be stronger than original); `override_justification` long-input (required) |
 | **EVOLVE** | `governance_evolve` | `#EC4899` | `proposed_changes` long-input; `version_bump` dropdown (MAJOR, MINOR, PATCH); no receipt output (EVOLVE does not produce a commitment receipt — it triggers a protocol version change) |
 
-### 3.5 Shared CP Utilities
+### 3.5 Shared Sub-Blocks (All CP Types)
+
+In addition to type-specific sub-blocks, every CP block definition includes these two shared sub-blocks:
+
+**`proposed_outcome`** (see §3.3 for full definition) — the outcome token being proposed. For AUTOMATED CPs, wired from upstream automation output. For MANUAL/SUPERVISED CPs, from the HITL block.
+
+**`actor_identity_config`** — actor configuration for AUTOMATED and DELEGATED CPs:
+
+```typescript
+// Add to every CP block's subBlocks array:
+{
+  id: 'actor_identity_config',
+  title: 'Actor Identity (Automated)',
+  type: 'short-input',
+  placeholder: 'Role or service account for automated submissions',
+  condition: { field: 'automation_level', value: ['AUTOMATED', 'AI_OVERSIGHT'] },
+  tooltip: 'For MANUAL/AI_ASSISTED flows, actor identity is resolved from the connected HITL block or the authenticated Sim user (Better Auth session). For AUTOMATED flows, set the accountable role here. See §6.5 for the GovernanceActorIdentity interface.',
+},
+```
+
+For MANUAL and AI_ASSISTED flows, actor identity is derived automatically from the authenticated user's role mapping (the Authority layer from the harness stack) — no manual config needed.
+
+---
+
+### 3.6 Shared CP Utilities
 
 ```typescript
 // apps/sim/blocks/blocks/governance/utils.ts
@@ -624,6 +659,53 @@ const GATE_HANDLE_LABELS: Record<string, string> = {
 
 ## 6. Enforcement Integration
 
+### 6.0 GovernedContext Creation Flow
+
+A `GovernedContext` in Precepto is the container for all receipts in a single case (one instance of a protocol running for one subject). Every `CommitmentSubmission` must reference a `context_id` — without it, Precepto cannot chain receipts, evaluate dependency gates, or track `CommitmentPointState` across the workflow execution.
+
+#### When Is a Context Created?
+
+For MVP, the context is created **automatically on the first CP block execution** in a given workflow run, if no `context_id` already exists in the execution's variables:
+
+```typescript
+// At the top of GovernanceCPBlockHandler.execute():
+let contextId = ctx.variables?.['governed_context_id'] as string | undefined
+
+if (!contextId) {
+  // First CP block in this execution — create the Precepto context
+  const context = await client.createContext({
+    protocol_version_id: params.protocol_version_id,
+    execution_mode: 'DRY_RUN',   // hardcoded for MVP (see DRY_RUN note in §6.1)
+    subject_ref: ctx.workflowExecutionId,
+  })
+  contextId = context.id
+  // Store in workflow execution variables so all subsequent CP blocks share it
+  ctx.variables = { ...ctx.variables, governed_context_id: contextId }
+}
+```
+
+#### How `context_id` Flows Through the Workflow
+
+1. **Trigger fires** — a new workflow execution starts. No `governed_context_id` in execution variables yet.
+2. **First CP block executes** — `GovernanceCPBlockHandler` calls `createContext()` on Precepto. The returned `context_id` is written to `ctx.variables['governed_context_id']`.
+3. **Subsequent CP blocks** — each reads `governed_context_id` from `ctx.variables`. No new context is created; all blocks share the same context.
+4. **All receipts** in the execution are chained within this context. Precepto links them, evaluates dependency gates across them, and builds the full audit trail.
+
+#### Future: “Start Case” Trigger Block (Post-MVP)
+
+For post-MVP, a dedicated **Start Case** trigger block will create the Precepto context explicitly before any CP block executes. This makes context creation visible on the canvas and allows the operator to configure context-level settings (subject identity, protocol version, retention policy) in a panel editor. For MVP, implicit creation on first CP execution is sufficient.
+
+#### Context Lifecycle (MVP)
+
+- **Created:** On first CP block execution in a workflow run (implicitly)
+- **Active:** For the duration of that workflow execution
+- **Archived:** Never explicitly in MVP — Precepto manages context lifecycle independently
+- **Reopened:** Not supported in MVP
+
+See Open Question Q6 (§14) for the full lifecycle discussion.
+
+---
+
 ### 6.1 The CP Block Executor
 
 CP blocks get a dedicated `GovernanceCPBlockHandler` in the Sim executor. This handler does **not** call any LLM. It calls Precepto's enforcement engine via HTTP.
@@ -643,12 +725,19 @@ apps/sim/executor/handlers/governance/
 import type { BlockHandler, BlockOutput, SerializedBlock } from '@/executor/types'
 import type { ExecutionContext } from '@/executor/types'
 import { isCPBlock, CP_IGSL_TYPE_MAP } from '@/blocks/blocks/governance/utils'
-import { PrecepsoClient } from './precepto-client'
-import type { CommitmentSubmission } from './types'
+import { PreceptoClient } from './precepto-client'
+import type { CommitmentSubmission, GovernanceActorIdentity } from './types'
 
 export class GovernanceCPBlockHandler implements BlockHandler {
+  // DRY_RUN is hardcoded for the entire MVP period.
+  // All receipts are tagged DRY_RUN per roadmap constraint.
+  // Remove this flag when transitioning to production enforcement.
+  private readonly DRY_RUN = true
+
   canHandle(block: SerializedBlock): boolean {
-    return isCPBlock(block.metadata?.id ?? '')
+    // block.type is the registry key (e.g. 'governance_decide') — NOT block.metadata?.id (instance UUID)
+    // Use isCPBlock() which checks against the CP_TYPES set, or use block.type.startsWith('governance_')
+    return isCPBlock(block.type)
   }
 
   async execute(
@@ -657,20 +746,26 @@ export class GovernanceCPBlockHandler implements BlockHandler {
     inputs: Record<string, unknown>
   ): Promise<BlockOutput> {
     const params = block.config.params
-    const commitmentType = CP_IGSL_TYPE_MAP[block.metadata.id as CPBlockType]
+    // block.type is the registry key (e.g. 'governance_decide') — correct field for CP type lookup
+    const commitmentType = CP_IGSL_TYPE_MAP[block.type as CPBlockType]
+
+    // Resolve the GovernedContext for this execution (see §6.0)
+    const contextId = ctx.variables?.['governed_context_id'] as string | undefined
 
     // Build the CommitmentSubmission from resolved inputs + block config
     const submission: CommitmentSubmission = {
       commitment_point_id: params.cp_id,     // Precepto CP ID linked to this block
-      actor_identity: inputs.authority_in as ActorIdentity ?? ctx.actorIdentity,
-      outcome: params.proposed_outcome ?? 'APPROVED',   // override-able per automation
+      context_id: contextId,                 // GovernedContext — links all receipts in this case
+      actor_identity: inputs.authority_in as GovernanceActorIdentity ?? ctx.actorIdentity,
+      outcome: params.proposed_outcome,      // set via proposed_outcome sub-block or upstream automation
       evidence: this.buildEvidenceMap(inputs.evidence_in, params.evidence_requirements),
       reasoning_text: inputs.reasoning_text as string ?? null,
       reasoning_privilege: params.reasoning_privilege ?? 'NONE',
+      dry_run: this.DRY_RUN,               // tagged DRY_RUN for entire MVP period
     }
 
     // Call Precepto enforcement engine
-    const client = new PrecepsoClient(ctx.env.PRECEPTO_API_URL, ctx.env.PRECEPTO_API_KEY)
+    const client = new PreceptoClient(ctx.env.PRECEPTO_API_URL, ctx.env.PRECEPTO_API_KEY)
 
     let response: CommitmentResponse
     try {
@@ -769,7 +864,7 @@ export function getAllHandlers(): BlockHandler[] {
 ```typescript
 // apps/sim/executor/handlers/governance/precepto-client.ts
 
-export class PrecepsoClient {
+export class PreceptoClient {
   constructor(
     private readonly baseUrl: string,
     private readonly apiKey: string
@@ -827,21 +922,51 @@ PRECEPTO_API_URL=https://precepto-api.railway.app
 PRECEPTO_API_KEY=<workspace-scoped key from Precepto mcp_api_keys table>
 ```
 
-### 6.3 Execution Flow (End-to-End)
+### 6.3 Actor Identity
+
+#### Interface
+
+```typescript
+// apps/sim/executor/handlers/governance/types.ts
+
+interface GovernanceActorIdentity {
+  actor_id: string              // User ID from Sim's auth (Better Auth)
+  role: string                  // Institutional role (e.g., 'technical_reviewer')
+  verification_method: 'PLATFORM_AUTH' | 'DELEGATED' | 'ATTESTED'
+  delegation_chain?: string[]   // If acting on behalf of another actor
+}
+```
+
+#### Resolution in the Handler
+
+The handler resolves actor identity from three sources, in priority order:
+
+1. **`inputs.authority_in`** — an upstream HITL block or identity block explicitly provides the actor. Used for MANUAL and SUPERVISED workflows where the approving officer is known at runtime. The `authority_in` input is expected to conform to `GovernanceActorIdentity`.
+2. **`ctx.userId` (Sim auth session)** — for AI_ASSISTED workflows, the logged-in Sim user is the accountable actor. Verification method: `PLATFORM_AUTH`.
+3. **`params.actor_identity_config` (block config)** — for AUTOMATED workflows, a configured service account or role string. Verification method: `ATTESTED`.
+
+Upstream blocks (HITL, OAuth, credential verifiers) connected to the `authority-in` gate handle must produce a `GovernanceActorIdentity`-shaped JSON object.
+
+---
+
+### 6.4 Execution Flow (End-to-End)
 
 ```
 1. Workflow runs. DAG reaches a CP block node.
 2. BlockExecutor.execute() is called.
 3. findHandler() → GovernanceCPBlockHandler.canHandle() returns true.
+   (Checks block.type via isCPBlock() — NOT block.metadata?.id)
 4. resolver.resolveInputs() resolves upstream outputs:
      - inputs.evidence_in  ← output of API block connected to evidence-in handle
-     - inputs.authority_in ← output of HITL block connected to authority-in handle
+     - inputs.authority_in ← output of HITL block connected to authority-in handle (GovernanceActorIdentity)
      - inputs.activation   ← output of upstream CP's receipt connected to activation handle
 5. GovernanceCPBlockHandler.execute() runs:
-     a. Builds CommitmentSubmission from resolved inputs + block subBlock values
-     b. Calls PrecepsoClient.submitCommitment()
-     c. Precepto evaluates 6 gates deterministically (no LLM)
-     d. Returns COMMITTED | BLOCKED | FINALIZING
+     a. Resolves or creates GovernedContext (see §6.0) — stores context_id in ctx.variables
+     b. Builds CommitmentSubmission from resolved inputs + block subBlock values
+        (including proposed_outcome, context_id, dry_run: true)
+     c. Calls PreceptoClient.submitCommitment()
+     d. Precepto evaluates 6 gates deterministically (no LLM)
+     e. Returns COMMITTED | BLOCKED | FINALIZING
 6. On COMMITTED:
      - outputs: { receipt, outcome_token, blocked_gates: [], receipt_hash }
      - EdgeManager routes downstream based on outcome_token
@@ -855,7 +980,7 @@ PRECEPTO_API_KEY=<workspace-scoped key from Precepto mcp_api_keys table>
      - HITL or signature-collection block handles finalization
 ```
 
-### 6.4 Linking Sim Blocks to Precepto CPs
+### 6.5 Linking Sim Blocks to Precepto CPs
 
 Each CP block has a hidden `cp_id` sub-block — the Precepto commitment point ID that this Sim block enforces through:
 
@@ -1457,121 +1582,71 @@ The `PRECEPTO_API_KEY` is a workspace-scoped key from Precepto's `mcp_api_keys` 
 
 ## 12. Phased Implementation Plan
 
-### Phase 1 — Foundation (Weeks 1–2)
+### Phase 1 — Compose (Weeks 1–3)
 
-**Goal:** 8 CP blocks on the canvas. Visual distinction. Toolbar section. Panel editor.
+**Goal:** Design governance protocols visually on Sim’s canvas, export valid IGSL.
 
-**Week 1:**
-
-- [ ] Create `apps/sim/blocks/blocks/governance/` directory
-- [ ] Implement all 8 CP block `BlockConfig` objects (start with `decide.ts` as reference, replicate pattern for the other 7)
+- [ ] 8 governance block type definitions (all CP types) — start with `decide.ts` as reference, replicate for the other 7
+- [ ] Register all 8 blocks in `blocks/registry.ts` with `category: 'governance'`
 - [ ] Add `'governance'` to `IntegrationTag` union in `blocks/types.ts`
-- [ ] Register all 8 blocks in `blocks/registry.ts`
-- [ ] Create governance icon directory `components/icons/governance/` with 8 SVG icons
-- [ ] Smoke test: governance blocks appear in toolbar under "Governance" section
-- [ ] Smoke test: clicking a governance block adds it to canvas
-- [ ] Smoke test: panel editor opens and shows all subBlocks correctly
-
-**Week 2:**
-
-- [ ] Add `CP` badge to block header in `workflow-block.tsx` (conditioned on `isCPBlock`)
-- [ ] Add distinctive ring border to CP blocks in canvas
-- [ ] Wire gate handle inputs/outputs (`evidence-in`, `authority-in`, `activation`, `outcome`, `blocked`)
-- [ ] Add edge labels for gate handle connections in `workflow-edge.tsx`
+- [ ] 8 governance icons (SVG) in `components/icons/governance/`
+- [ ] Panel editors with gate config sub-blocks (including `proposed_outcome` and `actor_identity_config`)
+- [ ] IGSL validation layer — real-time grammar checks on canvas (`validate-protocol.ts` + `validation-rules.ts`)
+- [ ] IGSL JSON export from canvas (`igsl-exporter.ts`)
+- [ ] Governance section in block menu/toolbar (auto-grouped via `integrationType: 'governance'`)
+- [ ] Visual treatment: blue color family, CP badge, distinctive 2px ring border
 - [ ] Create `utils.ts` with `isCPBlock()`, `CP_IGSL_TYPE_MAP`, `CP_TYPES`
+- [ ] Add `Protocol` tab to panel with validation issue list and Export button
+- [ ] Smoke test: governance blocks appear in toolbar under “Governance” section
+- [ ] Smoke test: panel editor opens and shows all sub-blocks correctly
 - [ ] Smoke test: can draw an edge from API block output to DECIDE `evidence-in` handle
-- [ ] Smoke test: block visually distinct from automation blocks
-
-**Deliverable:** A workflow with Slack → API → DECIDE → Gmail is drawable and visually coherent. CP blocks don't execute (no handler yet).
-
----
-
-### Phase 2 — Execution & Validation (Weeks 3–4)
-
-**Goal:** CP blocks execute through Precepto. IGSL validation renders on canvas. Export works.
-
-**Week 3:**
-
-- [ ] Create `executor/handlers/governance/precepto-client.ts`
-- [ ] Create `executor/handlers/governance/types.ts` (CommitmentSubmission, CommitmentResponse, PreflightResult)
-- [ ] Implement `GovernanceCPBlockHandler` in `executor/handlers/governance/governance-cp-handler.ts`
-- [ ] Register handler in `executor/handlers/registry.ts` (before GenericBlockHandler)
-- [ ] Add `PRECEPTO_API_URL` + `PRECEPTO_API_KEY` env vars and document them
-- [ ] Smoke test (DRY_RUN mode): run a workflow with a DECIDE block, verify it calls Precepto and returns a receipt
-- [ ] Smoke test: BLOCKED response from Precepto routes to "blocked" handle correctly
-
-**Week 4:**
-
-- [ ] Implement `lib/workflows/governance/validate-protocol.ts` and `validation-rules.ts`
-- [ ] Implement `useGovernanceValidation` hook
-- [ ] Wire validation indicators into `WorkflowBlock` (red/yellow ring, issue count badge)
-- [ ] Add `Protocol` tab to the panel (`components/panel/panel.tsx`)
-- [ ] Implement `Protocol` tab component with validation issue list and Export button
-- [ ] Implement `lib/workflows/governance/igsl-exporter.ts`
-- [ ] Wire Export button to download IGSL JSON
 - [ ] Smoke test: create a DECIDE block with missing evidence requirements → red ring appears
-- [ ] Smoke test: create APPEAL block without `appeals_cp_id` → WARN indicator appears
 - [ ] Smoke test: fix all issues → Export button becomes enabled → download valid JSON
 
-**Deliverable:** A CP block in a real workflow calls Precepto's enforcement engine. Validation runs live. IGSL export downloads valid JSON.
+**🏁 Demo milestone:** “I designed a building permit protocol on a canvas and exported valid IGSL v1.2 JSON”
 
 ---
 
-### Phase 3 — Gate Handles & Polish (Weeks 5–6)
+### Phase 2 — Execute (Weeks 4–6)
 
-**Goal:** CP-to-automation connections are clean, visually clear, and feel intentional. Block visual treatment is polished.
+**Goal:** Composed protocols actually run through Precepto’s enforcement engine.
 
-**Week 5:**
+- [ ] Governance block executor (`GovernanceCPBlockHandler`) in `executor/handlers/governance/`
+- [ ] Precepto client integration (HTTP) — `precepto-client.ts` + `types.ts` (CommitmentSubmission, CommitmentResponse, GovernanceActorIdentity)
+- [ ] GovernedContext creation flow: start case → get `context_id` → store in `ctx.variables['governed_context_id']` (see §6.0)
+- [ ] Gate handle system: `evidence-in`, `authority-in`, `activation` connection points + edge labels in `workflow-edge.tsx`
+- [ ] Automation blocks wire to CP gate handles
+- [ ] Receipt flow: `outcome_token`, `gate_results`, `blocked_gates` downstream
+- [ ] DRY_RUN mode enforced — `dry_run: true` hardcoded in `GovernanceCPBlockHandler` for entire MVP period
+- [ ] Actor identity resolved from Sim auth → Precepto submission (see §6.3 `GovernanceActorIdentity`)
+- [ ] Register handler in `executor/handlers/registry.ts` before `GenericBlockHandler`
+- [ ] Add `PRECEPTO_API_URL` + `PRECEPTO_API_KEY` env vars
+- [ ] Smoke test: run a workflow with a DECIDE block → calls Precepto → returns a receipt (DRY_RUN)
+- [ ] Smoke test: BLOCKED response from Precepto routes to “blocked” handle correctly
+- [ ] Smoke test: APPEAL block has `appeals_cp_id` → correct DEPENDENCY gate evaluation
+- [ ] Integration test: full workflow (Slack + API → DECIDE → Gmail) runs end-to-end in DRY_RUN
 
-- [ ] Refine gate handle visual treatment: color-coded handle endpoints per gate type
-  - `evidence-in`: amber dot (`#F59E0B`)
-  - `authority-in`: green dot (`#10B981`)
-  - `activation`: blue dot (`#3B82F6`)
-  - `outcome` / `blocked` output handles: matching colors
-- [ ] Add gate handle tooltips explaining what to connect (renders on hover)
-- [ ] Implement edge label rendering for gate handle edges (§5.4)
-- [ ] Polish CP block header: ensure `CP` badge, icon, and title are visually balanced across all 8 types
-- [ ] Add `useGovernanceBlocks(workflowId)` hook — filters blocks to CP types only (used by copilot and export)
-- [ ] Add `useGateStatus(blockId)` hook — real-time gate evaluation status from Precepto (via preflight call after evidence-in changes)
-
-**Week 6:**
-
-- [ ] Governance-specific block menu items in `block-menu.tsx`:
-  - "View Receipt" — opens the Precepto receipt for the last execution of this CP
-  - "Run Preflight" — triggers a dry-run gate evaluation with current connected inputs
-- [ ] Keyboard shortcut: `Shift+G` → opens Protocol tab in panel
-- [ ] Block tooltip for CP blocks: shows which gates are configured, which are missing
-- [ ] Governance blocks section header in toolbar (currently auto-grouped by `integrationType`)
-- [ ] Integration test: full workflow (Slack + API → DECIDE → Gmail) runs end-to-end in DRY_RUN through Precepto
-
-**Deliverable:** The visual connection between automation blocks and CP gate handles is clear and purposeful. An engineer reading the canvas can immediately understand what feeds each gate.
+**🏁 Demo milestone:** “A case runs end-to-end, enforcement engine evaluates every gate, receipts chain correctly”
 
 ---
 
-### Phase 4 — Copilot & Scaffolding (Weeks 7–8)
+### Phase 3 — Assist (Weeks 7–8)
 
-**Goal:** Governance copilot works. Pattern templates scaffold onto canvas. Module scaffolding from copilot chat.
+**Goal:** AI helps compose protocols, pattern templates scaffold instantly.
 
-**Week 7:**
-
-- [ ] Implement `app/api/governance-copilot/route.ts` (Anthropic API, governance system prompt)
-- [ ] Pre-load IGSL v1.2 digest as a server-side constant (`lib/workflows/governance/igsl-digest.ts`)
-- [ ] Pre-load reference manual overview (`lib/workflows/governance/reference.ts`)
-- [ ] Wire `Copilot` panel tab to use governance copilot endpoint when CP blocks present
-- [ ] Implement `add_governance_blocks` tool call handler (client-side): calls `batchAddBlocks()` from workflow store
-- [ ] Implement `scaffold_pattern` tool call handler: calls pattern scaffold functions
-- [ ] Smoke test: "Build a simple certification protocol" → copilot scaffolds ATTEST → CLOSE
-
-**Week 8:**
-
-- [ ] Implement all 7 pattern scaffold functions in `lib/workflows/governance/patterns/`
-- [ ] Copilot explains validation issues when user asks "what's wrong with my protocol?"
-- [ ] Copilot suggests fixes: "Your APPEAL block needs an `appeals_cp_id`. Click here to set it."
-- [ ] Pattern template quick-access in the `Protocol` tab (7 template buttons alongside the Export button)
-- [ ] `bestPractices` field populated on all 8 CP blocks (immediate, no infra needed — just text in the `BlockConfig`)
+- [ ] Governance copilot (Anthropic-backed, not Mothership) — `app/api/governance-copilot/route.ts`
+- [ ] IGSL v1.2 digest + reference manual pre-loaded in copilot server context
+- [ ] `add_governance_blocks` tool call: adds CP blocks + edges to canvas via `batchAddBlocks()`
+- [ ] `scaffold_pattern` tool call: scaffolds one of 7 named governance patterns
+- [ ] 7 pattern templates from reference manual: Permissioning Chain, Conditionality Loop, Deliberative Sequence, Competitive Allocation, Sequential Adjudication, Simple Certification, Surge Protocol
+- [ ] Module scaffolding: grouped CP blocks from pattern templates
+- [ ] Wire Copilot tab to governance endpoint when CP blocks present
+- [ ] Pattern template quick-access buttons in the Protocol tab
+- [ ] Copilot explains validation issues and suggests fixes
+- [ ] Smoke test: “Build a simple certification protocol” → copilot scaffolds ATTEST → CLOSE
 - [ ] Demo run: encode a Permissioning Chain from scratch using only the copilot
 
-**Deliverable:** A non-engineer can describe a governance requirement in plain language and the copilot scaffolds a structurally valid IGSL protocol onto the canvas.
+**🏁 Demo milestone:** “I said ‘build me a conditionality loop for cash transfers’ and it scaffolded the protocol”
 
 ---
 
@@ -1712,6 +1787,19 @@ If yes, the copilot could read existing protocols from Precepto and scaffold bas
 For the current MVP (one workspace = one institution), this is resolved by the `PRECEPTO_API_KEY` env var, which is scoped to one institution. Multi-institution is deferred to after the demo.
 
 When multi-institution support is added, the API key will need to be resolved per workspace via Sim's `workspaceBYOKKeys` table — the handler reads the key from workspace environment variables rather than global env.
+
+---
+
+### Q6: GovernedContext lifecycle — when is a context created, archived, reopened?
+
+**Current approach for MVP:** Created implicitly on first CP block execution in a workflow run (see §6.0). Never explicitly archived. Precepto manages context lifecycle independently.
+
+**Open decisions:**
+- Should a context be explicitly closed (archived) when a CLOSE CP block commits? Or is archival always Precepto-side?
+- Can a case be reopened (e.g., after a successful APPEAL)? What does “reopening” mean at the `GovernedContext` level — a new context, or a state transition on the existing one?
+- Should `context_id` be surfaced in Sim’s execution history UI so operators can trace a case across multiple workflow executions?
+
+**Recommendation for MVP:** Created on first CP execution, never archived from Sim’s side. Revisit archival and reopen semantics after the demo when real case management patterns emerge.
 
 ---
 
